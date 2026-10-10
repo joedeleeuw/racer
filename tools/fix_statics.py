@@ -9,10 +9,12 @@ Iteratively fix static_0_* auto-detection errors by:
 """
 import subprocess
 import sys
+import os
 import re
 import struct
 
-RECOMP_EXE = r"D:\recomp\n64\N64Recomp\build\Release\N64Recomp.exe"
+RECOMP_EXE = os.environ.get("N64RECOMP",
+    r"D:\recomp\n64\N64Recomp\build\Release\N64Recomp.exe")
 TOML_PATH = "recomp.toml"
 SYMBOLS_PATH = "symbols.toml"
 ROM_PATH = "baserom.z64"

@@ -14,12 +14,45 @@
 #include <fstream>
 #include <sstream>
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <dbghelp.h>
+#endif
 
 #include <SDL.h>
 #include <SDL_syswm.h>
+
+#if defined(__linux__)
+// SDL_syswm.h pulls in the X11 headers, whose macros (None, Status, Success,
+// True/False, Always, ...) collide with ultramodern's enum class members.
+#undef None
+#undef Status
+#undef Success
+#undef LockMask
+#undef Always
+#undef True
+#undef False
+#undef Bool
+#undef KeyPress
+#undef KeyRelease
+#undef FocusIn
+#undef FocusOut
+#undef Expose
+#undef CursorShape
+#undef Unsorted
+#undef Convex
+#undef Complex
+#undef GrayScale
+#undef FontChange
+#undef Screen
+#endif
+
+#if !defined(_WIN32)
+#include <csignal>
+#include <execinfo.h>
+#include <unistd.h>
+#endif
 
 #include "recomp.h"
 #include "librecomp/game.hpp"
@@ -65,43 +98,273 @@ static uint8_t* g_rdram_base = nullptr;
 //   a0 = direction (1 = DRAM->PIF write, 0 = PIF->DRAM read)
 //   a1 = DRAM buffer address
 //
-// There is no PIF hardware here, so on a read we synthesize the controller
-// status block the game's detection code (func_800899E8) expects: 8 bytes per
-// channel, 4 channels. Controller 0 is reported present (standard pad, no pak);
-// channels 1-3 report "no controller" via the error bits in byte 2.
+// There is no PIF hardware here. On a write we save the command block; on a
+// read we answer per command: status (boot probe, func_800899E8) or button
+// data from the host input callback. Controller 0 is reported present
+// (standard pad, no pak); channels 1-3 report "no controller" via the error
+// bits in byte 2.
 //   byte0 pad | byte1 txsize | byte2 rxsize/error | byte3 cmd
-//   byte4 type_lo | byte5 type_hi | byte6 status | byte7 pad
+//   byte4..7: type_lo/hi + status (status cmd) or buttons/stick (read cmd)
 // The parser checks (byte2 & 0xC0) for an error, reads type from byte4/5 and
 // the pak/status flag from byte6.
+bool get_input(int controller_num, uint16_t* buttons, float* x, float* y); // defined with the input callbacks below
+
 extern "C" void __osSiRawStartDma_recomp(uint8_t* rdram, recomp_context* ctx) {
     int32_t  dir = (int32_t)ctx->r4;
     uint32_t buf = (uint32_t)ctx->r5;
 
-    if (dir == 0 && buf != 0) {
-        // PIF -> DRAM read: fill in the controller status response.
-        // The block is word-aligned, so big-endian-packed word writes land the
-        // bytes correctly for the recompiled MEM_B (XOR 3) accessors.
-        auto w32 = [&](uint32_t addr, uint32_t value) {
-            *(uint32_t*)(rdram + (addr - 0x80000000u)) = value;
-        };
+    // The game writes the PIF command block (dir=1) then reads the response
+    // (dir=0) through the same 8-bytes-per-channel layout:
+    //   byte0 pad | byte1 txsize | byte2 rxsize/error | byte3 cmd | byte4..7 data
+    // Keep the last command block so reads answer per command:
+    // cmd 0x00/0xFF = controller status (boot probe), cmd 0x01 = read buttons.
+    static uint8_t pif_cmd[32]; // 4 channels x 8 bytes, guest byte order
+    static bool pif_cmd_valid = false;
+    auto w32 = [&](uint32_t addr, uint32_t value) {
+        // Big-endian-packed word writes land the bytes correctly for the
+        // recompiled MEM_B (XOR 3) accessors.
+        *(uint32_t*)(rdram + (addr - 0x80000000u)) = value;
+    };
+    if (dir == 1 && buf != 0) {
+        for (int i = 0; i < 32; i++) pif_cmd[i] = (uint8_t)MEM_B(i, buf);
+        pif_cmd_valid = true;
+        static int si_wr_log = 0;
+        if ((si_wr_log++ % 300) == 0) {
+            printf("[si] write @0x%08X:", buf);
+            for (int i = 0; i < 32; i++) printf(" %02X", pif_cmd[i]);
+            printf("\n");
+        }
+    } else if (dir == 0 && buf != 0) {
+        uint16_t buttons = 0;
+        float sx = 0.0f, sy = 0.0f;
+        get_input(0, &buttons, &sx, &sy);
+        const int8_t stick_x = (int8_t)(sx * 84.0f);
+        const int8_t stick_y = (int8_t)(sy * 84.0f);
         for (int ch = 0; ch < 4; ch++) {
+            const uint8_t cmd = pif_cmd_valid ? pif_cmd[ch * 8 + 3] : 0xFF;
             uint32_t c = buf + ch * 8;
             if (ch == 0) {
-                w32(c + 0, 0xFF010300u); // pad, tx=1, rx=3 (no error), cmd=0
-                w32(c + 4, 0x050000FFu); // type=0x0005 (standard pad), no pak
+                if (cmd == 0x01) {
+                    // Read: rx=4 data bytes (buttons BE, stick x, stick y).
+                    w32(c + 0, 0xFF010401u);
+                    w32(c + 4, (uint32_t)buttons | ((uint32_t)(uint8_t)stick_x << 16)
+                              | ((uint32_t)(uint8_t)stick_y << 24));
+                } else {
+                    // Status: standard pad present, no pak.
+                    w32(c + 0, 0xFF010300u);
+                    w32(c + 4, 0x050000FFu);
+                }
             } else {
                 w32(c + 0, 0xFF018300u); // byte2=0x83 -> error bit set
                 w32(c + 4, 0xFFFFFFFFu); // no controller on this channel
             }
         }
-        printf("[si] __osSiRawStartDma read  -> controller status written to 0x%08X\n", buf);
-    } else {
-        printf("[si] __osSiRawStartDma write -> dir=%d buf=0x%08X (acked)\n", dir, buf);
+        static int si_log = 0;
+        if ((si_log++ % 300) == 0) {
+            printf("[si] read: cmd=0x%02X buttons=0x%04X stick=%d,%d\n",
+                   pif_cmd_valid ? pif_cmd[3] : 0xFF, buttons, stick_x, stick_y);
+        }
     }
 
     // No real hardware to wait on — signal SI completion immediately.
     ultramodern::send_si_message();
     ctx->r2 = 0; // success
+}
+
+// =============================================================================
+// Native sprintf (game func_8008A6B4, misidentified as "dma_read_rom")
+// =============================================================================
+// The game's sprintf wrapper funnels into a vformatter (func_80093180) whose
+// conversion dispatcher (func_80092B10) executes an indirect jump through a
+// ROM jump table that static recompilation cannot resolve; the whole printf
+// cluster (dispatcher, itoa, ftoa) is stubbed, which left the emit path
+// dereferencing an uninitialised segment descriptor pointer and crashing in
+// bcopy the first time the menu code formatted a string.
+//
+// This reimplements the wrapper's contract natively:
+//   a0 = dst, a1 = fmt, varargs in a2/a3 + caller stack (o32: 16-byte home
+//   area at caller sp+0x00..0x0C, stack args at sp+0x10 and up). Returns the
+//   number of chars written; dst is NUL-terminated.
+//
+// Arg fetch replicates the original dispatcher's vararg walk: 8-byte
+// alignment for 'L' and doubles, 32-bit fetch otherwise; 'l' on both signed
+// and unsigned integer conversions fetches 32 bits and sign-extends (the
+// original sign-extends even for %lu — a quirk preserved here). Host snprintf
+// applies flags/width/precision per directive; its semantics match the
+// original formatter for the C89 set the game uses. %p prints the 32-bit
+// value (the original prints the sign-extension word, which is useless).
+extern "C" void swe1r_sprintf(uint8_t* rdram, recomp_context* ctx) {
+    // MEM_* macros expect sign-extended 64-bit guest addresses
+    // (0xFFFFFFFF80xxxxxx), as kept in ctx registers — never truncate to 32.
+    const uint64_t dst = ctx->r4;
+    const uint64_t fmt = ctx->r5;
+    uint32_t count = 0;
+
+    int argn = 0; // vararg index in 32-bit units; 0=a2, 1=a3, 2+=caller stack
+    auto fetch32 = [&]() -> uint32_t {
+        uint32_t v;
+        if (argn == 0) v = (uint32_t)ctx->r6;
+        else if (argn == 1) v = (uint32_t)ctx->r7;
+        else v = (uint32_t)MEM_W(0x10 + 4 * (argn - 2), ctx->r29);
+        argn += 1;
+        return v;
+    };
+    auto fetch64 = [&]() -> uint64_t {
+        if (argn & 1) argn++; // 8-byte alignment, as the original
+        uint64_t hi = fetch32();
+        uint64_t lo = fetch32();
+        return (hi << 32) | lo;
+    };
+    auto out_byte = [&](uint8_t b) { MEM_B(count, dst) = (int8_t)b; count++; };
+
+    for (uint32_t i = 0;; i++) {
+        uint8_t ch = MEM_BU(i, fmt);
+        if (ch == 0) break;
+        if (ch != '%') { out_byte(ch); continue; }
+        i++;
+
+        // Collect the directive for host snprintf: flags, width, precision.
+        char hfmt[40];
+        int hf = 0;
+        hfmt[hf++] = '%';
+        uint8_t c;
+        while ((c = MEM_BU(i, fmt)) == '-' || c == '+' || c == ' ' || c == '0' || c == '#') {
+            hfmt[hf++] = (char)c; i++;
+        }
+        while ((c = MEM_BU(i, fmt)) >= '0' && c <= '9') { hfmt[hf++] = (char)c; i++; }
+        if (c == '.') {
+            hfmt[hf++] = '.'; i++;
+            while ((c = MEM_BU(i, fmt)) >= '0' && c <= '9') { hfmt[hf++] = (char)c; i++; }
+        }
+        int lenmod = 0;
+        if (c == 'l' || c == 'L' || c == 'h') { lenmod = c; i++; c = MEM_BU(i, fmt); }
+
+        char tmp[512];
+        int n = 0;
+        switch (c) {
+        case 'd': case 'i': case 'u': case 'o': case 'x': case 'X': {
+            // Always host "ll"; truncation/length semantics applied in C++ so
+            // the host vararg type always matches the format.
+            uint64_t val;
+            bool sign = (c == 'd' || c == 'i');
+            if (lenmod == 'L') val = fetch64();
+            else if (lenmod == 'l')
+                // Original fetches 32 bits and sign-extends (even unsigned).
+                val = (uint64_t)(int64_t)(int32_t)fetch32();
+            else if (lenmod == 'h') {
+                uint32_t v = fetch32();
+                val = sign ? (uint64_t)(int64_t)(int16_t)v : (uint64_t)(v & 0xFFFF);
+            } else {
+                uint32_t v = fetch32();
+                val = sign ? (uint64_t)(int64_t)(int32_t)v : (uint64_t)v;
+            }
+            snprintf(hfmt + hf, sizeof(hfmt) - hf, "ll%c", c);
+            if (sign)
+                n = snprintf(tmp, sizeof(tmp), hfmt, (long long)val);
+            else
+                n = snprintf(tmp, sizeof(tmp), hfmt, (unsigned long long)val);
+            break;
+        }
+        case 'f': case 'e': case 'E': case 'g': case 'G': {
+            uint64_t bits = fetch64();
+            double d;
+            memcpy(&d, &bits, sizeof(d));
+            snprintf(hfmt + hf, sizeof(hfmt) - hf, "%c", c);
+            n = snprintf(tmp, sizeof(tmp), hfmt, d);
+            break;
+        }
+        case 'c': {
+            uint32_t v = fetch32();
+            snprintf(hfmt + hf, sizeof(hfmt) - hf, "c");
+            n = snprintf(tmp, sizeof(tmp), hfmt, (int)v);
+            break;
+        }
+        case 's': {
+            uint64_t p = (uint64_t)(int64_t)(int32_t)fetch32();
+            char sbuf[1024];
+            int sl = 0;
+            if (p != 0) { // original would fault on NULL; degrade to ""
+                uint8_t sb;
+                while (sl < (int)sizeof(sbuf) - 1 && (sb = MEM_BU(sl, p)) != 0)
+                    sbuf[sl++] = (char)sb;
+            }
+            sbuf[sl] = 0;
+            snprintf(hfmt + hf, sizeof(hfmt) - hf, "s");
+            n = snprintf(tmp, sizeof(tmp), hfmt, sbuf);
+            break;
+        }
+        case 'n': {
+            uint64_t p = (uint64_t)(int64_t)(int32_t)fetch32();
+            if (lenmod == 'h') MEM_H(0, p) = (int16_t)count;
+            else if (lenmod == 'l' || lenmod == 'L') {
+                MEM_W(0, p) = (int32_t)count;
+                MEM_W(4, p) = 0;
+            } else MEM_W(0, p) = (int32_t)count;
+            break;
+        }
+        case 'p': {
+            uint32_t v = fetch32();
+            n = snprintf(tmp, sizeof(tmp), "%#x", v);
+            break;
+        }
+        case '%':
+            out_byte('%');
+            break;
+        default:
+            // Unhandled conversion: the original emits the char literally.
+            out_byte(c);
+            break;
+        }
+        for (int k = 0; k < n && tmp[k]; k++) out_byte((uint8_t)tmp[k]);
+    }
+    MEM_B(count, dst) = 0; // wrapper NUL-terminates
+    ctx->r2 = count;
+    ctx->r3 = count;
+}
+
+// =============================================================================
+// Native cart word read (game func_8008A710, its osPiReadIo)
+// =============================================================================
+// The loader (func_80011D60/func_80011BDC) reads the ROM asset table and
+// records word-at-a-time through this primitive instead of PI DMA. Its body
+// chains get-access (0x80093820) -> raw read (0x80093890) -> rel-access
+// (0x80093864), all of which are stubbed, so every asset-table read returned
+// garbage and the asset loader (func_800305F4) rejected every index, leaving
+// func_8004611C to dereference the resulting NULL. Semantics: a0 = cart
+// address (K1), a1 = guest u32* out, returns 0. Byte placement matches
+// recomp::do_rom_pio (raw ROM bytes through MEM_B, same as the DMA path).
+extern "C" void swe1r_pi_read_io(uint8_t* rdram, recomp_context* ctx) {
+    const uint32_t physical = ((uint32_t)ctx->r4) & 0x1FFFFFFF;
+    const uint64_t out = ctx->r5; // sign-extended guest pointer
+    std::span<const uint8_t> rom = recomp::get_rom();
+    // The boot code that initializes the game's cart PI handle is stubbed, so
+    // its baseAddress stays 0 and devAddr arrives as a raw ROM file offset
+    // (the DMA redirect ORs rom_base in for the same reason). Accept both
+    // domains: values below rom_base are already file offsets.
+    const size_t off = (physical >= recomp::rom_base) ? (size_t)(physical - recomp::rom_base)
+                                                      : (size_t)physical;
+    if (off + 4 <= rom.size() && (off & 3) == 0 && ((uint32_t)out & 3) == 0) {
+        recomp::do_rom_pio(rdram, out, (uint32_t)(off + recomp::rom_base));
+    } else {
+        fprintf(stderr, "[pi] unaligned/out-of-rom PIO read: devAddr=0x%08X out=0x%08X\n",
+                (uint32_t)ctx->r4, (uint32_t)out);
+        MEM_W(0, out) = 0;
+    }
+    ctx->r2 = 0;
+}
+
+// =============================================================================
+// Hand-written entry points for late-discovered function starts
+// =============================================================================
+// Function discovery placed func_8004441C eight bytes late; the true entry at
+// 0x80044414 first loads the flag global at 0x800D7700 into v0, and callers
+// jal there directly. Mirrors the two instructions, then chains into the
+// discovered body. Registered via HAND_ENTRIES in tools/gen_lookup_table.py.
+extern "C" void func_8004441C(uint8_t* rdram, recomp_context* ctx);
+extern "C" void func_80044414(uint8_t* rdram, recomp_context* ctx) {
+    // 0x80044414: lui v0, 0x800d / 0x80044418: lw v0, 0x7700(v0)
+    ctx->r2 = MEM_W(0x7700, 0xFFFFFFFF800D0000ull);
+    func_8004441C(rdram, ctx);
 }
 
 // =============================================================================
@@ -168,11 +431,16 @@ ultramodern::gfx_callbacks_t::gfx_data_t create_gfx() {
 }
 
 ultramodern::renderer::WindowHandle create_window(ultramodern::gfx_callbacks_t::gfx_data_t) {
+    uint32_t window_flags = SDL_WINDOW_RESIZABLE;
+#ifdef RT64_SDL_WINDOW_VULKAN
+    window_flags |= SDL_WINDOW_VULKAN;
+#endif
+
     g_window = SDL_CreateWindow(
         "Star Wars Episode I: Racer",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         1280, 960,
-        SDL_WINDOW_RESIZABLE
+        window_flags
     );
 
     if (!g_window) {
@@ -182,6 +450,7 @@ ultramodern::renderer::WindowHandle create_window(ultramodern::gfx_callbacks_t::
 
     printf("[SWE1R] Window created (1280x960)\n");
 
+#if defined(_WIN32)
     // Return native window handle
     SDL_SysWMinfo wminfo;
     SDL_VERSION(&wminfo.version);
@@ -191,6 +460,12 @@ ultramodern::renderer::WindowHandle create_window(ultramodern::gfx_callbacks_t::
     handle.window = wminfo.info.win.window;
     handle.thread_id = GetCurrentThreadId();
     return handle;
+#elif defined(RT64_SDL_WINDOW_VULKAN)
+    // Linux: ultramodern's WindowHandle is the SDL_Window* itself.
+    return ultramodern::renderer::WindowHandle{ g_window };
+#else
+    return ultramodern::renderer::WindowHandle{ g_window, nullptr };
+#endif
 }
 
 void update_gfx(ultramodern::gfx_callbacks_t::gfx_data_t) {
@@ -224,6 +499,23 @@ bool get_input(int controller_num, uint16_t* buttons, float* x, float* y) {
     *buttons = 0;
     *x = 0.0f;
     *y = 0.0f;
+
+    // Debug harness: SWE1R_SCRIPT_INPUT="frame:mask,frame:mask,..." presses the
+    // given N64 button mask for exactly one call once the call counter passes
+    // the frame. Proves the guest consumes the SI input path end-to-end without
+    // needing a focused keyboard in a headless session.
+    static const char* script = getenv("SWE1R_SCRIPT_INPUT");
+    static unsigned long call_count = 0;
+    call_count++;
+    if (script && *script) {
+        unsigned long frame = 0; unsigned int mask = 0; int used = 0;
+        if (sscanf(script, "%lu:%x%n", &frame, &mask, &used) == 2 && call_count >= frame) {
+            *buttons |= (uint16_t)mask;
+            script += used;
+            if (*script == ',') script++; else { script = ""; }
+        }
+        return true;
+    }
 
     // Basic keyboard input
     const uint8_t* keys = SDL_GetKeyboardState(nullptr);
@@ -272,7 +564,7 @@ void gfx_init_callback() {
     // This must happen after start() has begun, not before, so the VI
     // thread gets a chance to set dummy VI state before is_game_started() is true.
     std::u8string game_id = u8"swe1racer";
-    recomp::start_game(game_id);
+    recomp::start_game(game_id, "default");
     printf("[SWE1R] Game started\n");
 }
 
@@ -383,6 +675,7 @@ void on_game_init(uint8_t* rdram, recomp_context* ctx) {
     printf("[SWE1R] osMemSize=0x800000 written at 0x80000318\n");
 }
 
+#ifdef _WIN32
 // =============================================================================
 // Map-file symbolizer
 //
@@ -515,13 +808,56 @@ static LONG WINAPI crash_handler(EXCEPTION_POINTERS* ep) {
     fflush(stderr);
     return EXCEPTION_EXECUTE_HANDLER;
 }
+#endif
+
+#if !defined(_WIN32)
+// POSIX equivalent of the Windows crash handler: prints the fault address, maps
+// it back into N64 address space when it lands in RDRAM, and dumps a symbolized
+// stack (build with -rdynamic so the recompiled func_XXXX names resolve).
+static void posix_crash_handler(int sig, siginfo_t* info, void* /*ucontext*/) {
+    void* frames[96];
+    const int count = backtrace(frames, 96);
+    const void* fault = (info != nullptr) ? info->si_addr : nullptr;
+
+    fprintf(stderr, "\n[CRASH] signal %d (%s) at fault address %p\n", sig, strsignal(sig), fault);
+    if (g_rdram_base != nullptr && fault != nullptr) {
+        const int64_t off = static_cast<int64_t>(reinterpret_cast<uintptr_t>(fault) - reinterpret_cast<uintptr_t>(g_rdram_base));
+        if (off >= -0x10000 && off < 0x00900000) {
+            fprintf(stderr, "[CRASH] in RDRAM at offset %+lld (N64 byte addr ~0x%08X)\n",
+                    static_cast<long long>(off), static_cast<unsigned>(off + 0x80000000));
+        }
+        else {
+            fprintf(stderr, "[CRASH] outside RDRAM (rdram_base=%p, offset %+lld)\n",
+                    static_cast<void*>(g_rdram_base), static_cast<long long>(off));
+        }
+    }
+    fprintf(stderr, "[CRASH] native stack:\n");
+    backtrace_symbols_fd(frames, count, STDERR_FILENO);
+    fflush(stderr);
+    _exit(128 + sig);
+}
+#endif
 
 int main(int argc, char* argv[]) {
     // Force unbuffered output so we see prints before crashes
     setvbuf(stdout, nullptr, _IONBF, 0);
     setvbuf(stderr, nullptr, _IONBF, 0);
+#ifdef _WIN32
     load_map_symbols();
     SetUnhandledExceptionFilter(crash_handler);
+#endif
+
+#if !defined(_WIN32)
+    {
+        struct sigaction sa{};
+        sa.sa_sigaction = posix_crash_handler;
+        sa.sa_flags = SA_SIGINFO | SA_RESETHAND;
+        sigemptyset(&sa.sa_mask);
+        for (int crash_sig : { SIGSEGV, SIGBUS, SIGABRT, SIGILL, SIGFPE }) {
+            sigaction(crash_sig, &sa, nullptr);
+        }
+    }
+#endif
 
     fprintf(stderr, "[DEBUG] main() entered\n");
 
@@ -535,6 +871,7 @@ int main(int argc, char* argv[]) {
     recomp::GameEntry game_entry{};
     game_entry.rom_hash = SWE1R_ROM_HASH;
     game_entry.internal_name = "STAR WARS EP1 RACER";
+    game_entry.display_name = "Star Wars Episode I: Racer";
     game_entry.game_id = u8"swe1racer";
     game_entry.mod_game_id = "swe1racer";
     game_entry.save_type = recomp::SaveType::Eep4k;
@@ -566,8 +903,35 @@ int main(int argc, char* argv[]) {
     // Set up config path
     recomp::register_config_path(std::filesystem::current_path());
 
+    // The runtime reloads the ROM from the config folder when the game starts,
+    // so store a validated copy there when it is missing.
+    recomp::check_all_stored_roms();
+    if (!recomp::is_rom_valid(u8"swe1racer")) {
+        const recomp::RomValidationError rom_err =
+            recomp::select_rom(std::filesystem::path{"baserom.z64"}, u8"swe1racer");
+        if (rom_err != recomp::RomValidationError::Good) {
+            fprintf(stderr, "[SWE1R] ROM validation failed (code %d); expected baserom.z64 in the working directory.\n",
+                    static_cast<int>(rom_err));
+            return 1;
+        }
+        printf("[SWE1R] Stored ROM validated and copied into the config folder\n");
+    }
+
     // Build the configuration
     recomp::Configuration cfg{};
+
+    // VI is a 60 Hz periodic event: when the game's VI queue is full, the correct
+    // behaviour (and real hardware's) is to drop the message, not requeue it.
+    // Requeueing VI turned the external-message pump into a busy-spin livelock
+    // (24M failed redeliveries in 10s) that starved the boot timer message and
+    // deadlocked the game's first delay wait. One-shot sources still requeue.
+    cfg.message_queue_control.requeue_timer = true;
+    cfg.message_queue_control.requeue_sp = true;
+    cfg.message_queue_control.requeue_si = true;
+    cfg.message_queue_control.requeue_ai = true;
+    cfg.message_queue_control.requeue_vi = false;
+    cfg.message_queue_control.requeue_pi = true;
+    cfg.message_queue_control.requeue_dp = true;
     cfg.project_version = { 0, 1, 0, "-alpha" };
 
     // RSP callbacks

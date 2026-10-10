@@ -4,6 +4,11 @@
 #include "librecomp/sections.h"
 #include "funcs.h"
 
+// Hand-written entry points (src/main.cpp)
+extern "C" {
+void func_80044414(uint8_t* rdram, recomp_context* ctx);
+}
+
 static FuncEntry section_funcs[] = {
     { recomp_entrypoint, 0x0, 0x50 },
     { boot_trampoline, 0x50, 0xBC },
@@ -407,7 +412,8 @@ static FuncEntry section_funcs[] = {
     { func_8004441C, 0x4401C, 0x94 },
     { func_800444B0, 0x440B0, 0x1B8 },
     { func_80044668, 0x44268, 0x99C },
-    { func_80045004, 0x44C04, 0x310 },
+    { func_80045004, 0x44C04, 0x140 },
+    { func_80045144, 0x44D44, 0x1D0 },
     { func_80045314, 0x44F14, 0x198 },
     { func_800454AC, 0x450AC, 0xDC },
     { func_80045588, 0x45188, 0x700 },
@@ -702,8 +708,10 @@ static FuncEntry section_funcs[] = {
     { func_800879C4, 0x875C4, 0x2FC },
     { static_0_80087CC0, 0x878C0, 0xB0 },
     { func_80087D70, 0x87970, 0x110 },
+    { osRecvMesg_recomp, 0x87A80, 0x1FC },
     { func_8008807C, 0x87C7C, 0x3C },
     { func_800880B8, 0x87CB8, 0x28 },
+    { osCreateMesgQueue_recomp, 0x87CE0, 0x30 },
     { func_80088110, 0x87D10, 0x40 },
     { func_80088150, 0x87D50, 0xC },
     { func_8008815C, 0x87D5C, 0x154 },
@@ -741,30 +749,41 @@ static FuncEntry section_funcs[] = {
     { func_8008A710, 0x8A310, 0x5C8 },
     { func_8008ACD8, 0x8A8D8, 0xD8 },
     { func_8008ADB0, 0x8A9B0, 0x80 },
+    { osSetEventMesg_recomp, 0x8AA30, 0x70 },
     { func_8008AEA0, 0x8AAA0, 0x11C },
+    { osSpTaskLoad_recomp, 0x8ABBC, 0x190 },
+    { osSpTaskStartGo_recomp, 0x8AD4C, 0x44 },
     { func_8008B190, 0x8AD90, 0x20 },
     { func_8008B1B0, 0x8ADB0, 0x168 },
     { func_8008B318, 0x8AF18, 0x10C },
     { func_8008B424, 0x8B024, 0x15C },
+    { osInitialize_recomp, 0x8B180, 0x290 },
+    { osCreateThread_recomp, 0x8B410, 0x150 },
+    { osStartThread_recomp, 0x8B560, 0x150 },
     { func_8008BAB0, 0x8B6B0, 0x180 },
     { func_8008BC30, 0x8B830, 0x190 },
     { func_8008BDC0, 0x8B9C0, 0x1F0 },
     { func_8008BFB0, 0x8BBB0, 0xE0 },
+    { osViSetEvent_recomp, 0x8BC90, 0x70 },
     { func_8008C100_dispatch, 0x8BD00, 0x50 },
     { func_8008C150, 0x8BD50, 0x40 },
     { func_8008C190, 0x8BD90, 0xF0 },
     { func_8008C280, 0x8BE80, 0x110 },
     { func_8008C390_tail, 0x8BF90, 0x20 },
     { osRecvMesg_unused_8008C3B0, 0x8BFB0, 0x1A0 },
+    { osGetCount_recomp, 0x8C150, 0x10 },
     { func_8008C560, 0x8C160, 0x210 },
     { func_8008C770, 0x8C370, 0x40 },
     { func_8008C7B0, 0x8C3B0, 0x180 },
     { func_8008C930_exception, 0x8C530, 0x150 },
+    { __osDisableInt_recomp, 0x8C680, 0x20 },
+    { __osRestoreInt_recomp, 0x8C6A0, 0x28 },
     { func_8008CAC8, 0x8C6C8, 0x664 },
     { libultra_split_8008D12C, 0x8CD2C, 0x158 },
     { libultra_split_8008D284, 0x8CE84, 0x1A8 },
     { func_8008D42C, 0x8D02C, 0x24 },
     { libultra_split_8008D450, 0x8D050, 0xC0 },
+    { osViSetMode_recomp, 0x8D110, 0x44 },
     { func_8008D554, 0x8D154, 0x54 },
     { func_8008D5A8, 0x8D1A8, 0x54 },
     { func_8008D5FC, 0x8D1FC, 0x88 },
@@ -795,13 +814,17 @@ static FuncEntry section_funcs[] = {
     { func_8008FEB0, 0x8FAB0, 0xE8 },
     { func_8008FF98, 0x8FB98, 0x148 },
     { func_800900E0, 0x8FCE0, 0x90 },
+    { osSetIntMask_recomp, 0x8FD70, 0x90 },
     { func_80090200, 0x8FE00, 0xA0 },
     { func_800902A0, 0x8FEA0, 0x90 },
     { func_80090330, 0x8FF30, 0xA0 },
+    { osAiSetFrequency_recomp, 0x8FFD0, 0x80 },
+    { osAiSetNextBuffer_recomp, 0x90050, 0x150 },
     { func_800905A0, 0x901A0, 0x58 },
     { func_800905F8, 0x901F8, 0x3C },
     { func_80090634, 0x90234, 0x2C },
     { func_80090660, 0x90260, 0x90 },
+    { osSetTimer_recomp, 0x902F0, 0xE0 },
     { func_80090880, 0x90480, 0xE0 },
     { func_80090960, 0x90560, 0xB0 },
     { func_80090A10, 0x90610, 0x210 },
@@ -833,7 +856,9 @@ static FuncEntry section_funcs[] = {
     { func_80093E44, 0x93A44, 0x170 },
     { func_80093FB4, 0x93BB4, 0x74 },
     { func_80094028, 0x93C28, 0x1B8 },
+    { osCreateViManager_recomp, 0x93DE0, 0x300 },
     { osPiStartDma_candidate_800944E0, 0x940E0, 0xE0 },
+    { osCreatePiManager_recomp, 0x941C0, 0x230 },
     { func_800947F0, 0x943F0, 0x490 },
     { func_80094C80, 0x94880, 0x1C4 },
     { func_80094E44, 0x94A44, 0x8C },
@@ -841,6 +866,7 @@ static FuncEntry section_funcs[] = {
     { func_80095048, 0x94C48, 0xAC },
     { func_800950F4, 0x94CF4, 0x1B8 },
     { osPiManager_candidate_800952AC, 0x94EAC, 0x574 },
+    { osPiStartDma_recomp, 0x95420, 0xBC },
     { func_800958DC, 0x954DC, 0xB4 },
     { func_80095990, 0x95590, 0x1D8 },
     { func_80095B68, 0x95768, 0xB8 },
@@ -864,6 +890,7 @@ static FuncEntry section_funcs[] = {
     { func_80097DC0, 0x979C0, 0xA0 },
     { func_80097E60, 0x97A60, 0x108 },
     { func_80097F68, 0x97B68, 0x498 },
+    { func_80044414, 0x44014, 0x8 },  // hand-written entry
     { static_0_8000097C, 0x57C, 0x0 },  // auto-detected
     { static_0_80002BD4, 0x27D4, 0x0 },  // auto-detected
     { static_0_80002E2C, 0x2A2C, 0x0 },  // auto-detected
@@ -1392,7 +1419,7 @@ SectionTableEntry section_table[] = {
         0x80000400,  // ram_addr
         0x98000,  // size
         section_funcs,  // funcs
-        1379,  // num_funcs
+        1401,  // num_funcs
         nullptr,  // relocs (none for static code)
         0,  // num_relocs
         0,  // index

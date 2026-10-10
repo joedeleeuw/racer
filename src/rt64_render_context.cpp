@@ -7,8 +7,14 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <memory>
 #include <string>
+#include <vector>
+
+// stb_image_write's implementation is compiled by RT64 (rt64_rdp_tmem.cpp), so
+// only the declarations are needed here.
+#include "stb_image_write.h"
 
 #include "ultramodern/renderer_context.hpp"
 #include "librecomp/game.hpp"
@@ -32,20 +38,76 @@ static void dummy_check_interrupts() {
     // No-op: ultramodern handles interrupts
 }
 
+// Bring-up aid: write the guest framebuffer to a PNG so rendered content can be
+// inspected without relying on the host window/compositor. Enabled by setting
+// SWE1R_FB_DUMP to a file path prefix.
+static void dump_guest_framebuffer(uint8_t* rdram, ultramodern::renderer::ViRegs* vi_regs,
+                                   const char* prefix, uint32_t frame) {
+    if (vi_regs == nullptr || prefix == nullptr) {
+        return;
+    }
+
+    // VI_ORIGIN holds the physical RDRAM address of the framebuffer being scanned out.
+    const uint32_t origin = vi_regs->VI_ORIGIN_REG & 0x3FFFFF;
+    const uint32_t width = vi_regs->VI_WIDTH_REG;
+    const uint32_t height = 240;
+
+    if (width == 0 || width > 1024 || origin == 0 || origin + width * height * 2 > 0x800000) {
+        return;
+    }
+
+    std::vector<uint8_t> rgb(static_cast<size_t>(width) * height * 3);
+
+    for (uint32_t y = 0; y < height; y++) {
+        for (uint32_t x = 0; x < width; x++) {
+            // Halfword reads go through the same XOR-2 swizzle as MEM_H in the recompiled code.
+            const uint32_t offset = (origin + (y * width + x) * 2) ^ 2;
+            const uint16_t pixel = *reinterpret_cast<const uint16_t*>(rdram + offset);
+            const uint8_t r5 = (pixel >> 11) & 0x1F;
+            const uint8_t g5 = (pixel >> 6) & 0x1F;
+            const uint8_t b5 = (pixel >> 1) & 0x1F;
+            uint8_t* dst = &rgb[(static_cast<size_t>(y) * width + x) * 3];
+            dst[0] = static_cast<uint8_t>((r5 << 3) | (r5 >> 2));
+            dst[1] = static_cast<uint8_t>((g5 << 3) | (g5 >> 2));
+            dst[2] = static_cast<uint8_t>((b5 << 3) | (b5 >> 2));
+        }
+    }
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s-%05u.png", prefix, frame);
+    if (stbi_write_png(path, static_cast<int>(width), static_cast<int>(height), 3,
+                       rgb.data(), static_cast<int>(width * 3)) != 0) {
+        printf("[SWE1R] framebuffer dump frame %u: %ux%u at 0x%06X -> %s\n",
+               frame, width, height, origin, path);
+    }
+}
+
 class SWE1RRenderContext : public ultramodern::renderer::RendererContext {
 public:
     SWE1RRenderContext(uint8_t* rdram, ultramodern::renderer::WindowHandle window_handle, bool developer_mode)
         : rdram_(rdram), window_handle_(window_handle), developer_mode_(developer_mode)
     {
         setup_result = ultramodern::renderer::SetupResult::Success;
+        fb_dump_prefix_ = std::getenv("SWE1R_FB_DUMP");
+#if defined(_WIN32)
         chosen_api = ultramodern::renderer::GraphicsApi::D3D12;
+#elif defined(__APPLE__)
+        chosen_api = ultramodern::renderer::GraphicsApi::Metal;
+#else
+        chosen_api = ultramodern::renderer::GraphicsApi::Vulkan;
+#endif
 
         // Get VI register pointers from ultramodern
         vi_regs_ = ultramodern::renderer::get_vi_regs();
 
         // Set up the RT64 Core structure
         RT64::Application::Core core{};
+#if defined(__linux__)
+        // RT64 is built with RT64_SDL_WINDOW_VULKAN, so RenderWindow is the SDL_Window*.
+        core.window = window_handle;
+#else
         core.window = window_handle.window;
+#endif
         core.RDRAM = rdram;
         core.DMEM = s_dmem;
         core.IMEM = s_imem;
@@ -100,7 +162,12 @@ public:
         app_ = std::make_unique<RT64::Application>(core, app_config);
 
         // Run setup (creates graphics device, swap chain, shader caches, etc.)
+#if defined(_WIN32)
         auto result = app_->setup(window_handle.thread_id);
+#else
+        // threadId is only consumed by the Win32 message hook.
+        auto result = app_->setup(0);
+#endif
 
         switch (result) {
         case RT64::Application::SetupResult::Success:
@@ -145,6 +212,13 @@ public:
         // RT64 doesn't have a separate instant present mode
     }
 
+    void send_dummy_workload(uint32_t fb_address) override {
+        // ultramodern asks the renderer for a workload when the game swaps
+        // framebuffers without submitting a display list. RT64 exposes no
+        // equivalent entry point, so there is nothing to forward yet.
+        (void)fb_address;
+    }
+
     void send_dl(const OSTask* task) override {
         if (!app_ || !is_valid_) return;
 
@@ -175,6 +249,10 @@ public:
         }
 
         app_->updateScreen();
+
+        if (fb_dump_prefix_ != nullptr && (screen_count_ % 120 == 0)) {
+            dump_guest_framebuffer(rdram_, vi_regs_, fb_dump_prefix_, screen_count_);
+        }
     }
 
     void shutdown() override {
@@ -203,6 +281,7 @@ private:
     std::vector<uint8_t> rom_header_;
     uint32_t dl_count_ = 0;
     uint32_t screen_count_ = 0;
+    const char* fb_dump_prefix_ = nullptr;
 };
 
 // Factory function

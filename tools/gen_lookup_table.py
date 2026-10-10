@@ -61,6 +61,15 @@ def parse_funcs_h(path):
     pattern = re.compile(r'void\s+(\w+)\s*\(')
     return set(pattern.findall(text))
 
+# Hand-written entry points (bodies live in src/main.cpp) for true function
+# starts that function discovery placed a few bytes late. func_80044414 is the
+# real entry of what symbols.toml calls func_8004441C: the two instructions
+# before the discovered prologue load the flag global into v0, and callers
+# jal to 0x80044414 directly.
+HAND_ENTRIES = [
+    ("func_80044414", 0x80044414, 0x8),
+]
+
 def main():
     section = parse_symbols(SYMBOLS_PATH)
     generated_funcs = parse_funcs_h(FUNCS_H_PATH)
@@ -70,12 +79,19 @@ def main():
     print(f"  Functions in symbols.toml: {len(section['functions'])}")
     print(f"  Functions in funcs.h: {len(generated_funcs)}")
 
-    # Match functions - only include those that exist in both
+    # Match functions - only include those that exist in both.
+    # N64Recomp renames known libultra functions to <name>_recomp (routing
+    # their bodies to ultramodern's native implementations), so a symbols.toml
+    # entry for osRecvMesg appears in funcs.h as osRecvMesg_recomp. Match on
+    # the renamed symbol too, or indirect (function-pointer) calls to those
+    # addresses have no table entry and fail lookup at runtime.
     matched = []
     missing = []
     for name, vram, size, offset in section['functions']:
         if name in generated_funcs:
             matched.append((name, vram, size, offset))
+        elif (name + "_recomp") in generated_funcs:
+            matched.append((name + "_recomp", vram, size, offset))
         else:
             missing.append((name, vram))
 
@@ -102,10 +118,22 @@ def main():
         f.write('#include "funcs.h"\n')
         f.write('\n')
 
+        # Declarations for hand-written entry points defined in src/main.cpp.
+        if HAND_ENTRIES:
+            f.write('// Hand-written entry points (src/main.cpp)\n')
+            f.write('extern "C" {\n')
+            for name, vram, size in HAND_ENTRIES:
+                f.write(f'void {name}(uint8_t* rdram, recomp_context* ctx);\n')
+            f.write('}\n\n')
+
         # Emit the function entries array
         f.write(f'static FuncEntry section_funcs[] = {{\n')
         for name, vram, size, offset in matched:
             f.write(f'    {{ {name}, 0x{offset:X}, 0x{size:X} }},\n')
+
+        for name, vram, size in HAND_ENTRIES:
+            offset = vram - section['vram']
+            f.write(f'    {{ {name}, 0x{offset:X}, 0x{size:X} }},  // hand-written entry\n')
 
         # Also add any extra static functions from funcs.h
         for func_name in extra_generated:
@@ -125,7 +153,7 @@ def main():
         f.write(f'        0x{section["vram"]:X},  // ram_addr\n')
         f.write(f'        0x{section["size"]:X},  // size\n')
         f.write(f'        section_funcs,  // funcs\n')
-        total_funcs = len(matched) + len([n for n in extra_generated if n.startswith('static_0_')])
+        total_funcs = len(matched) + len(HAND_ENTRIES) + len([n for n in extra_generated if n.startswith('static_0_')])
         f.write(f'        {total_funcs},  // num_funcs\n')
         f.write(f'        nullptr,  // relocs (none for static code)\n')
         f.write(f'        0,  // num_relocs\n')

@@ -2026,7 +2026,14 @@ size = 0x98000
   [[section.functions]]
   name = "func_80045004"
   vram = 0x80045004
-  size = 0x310
+  size = 0x140
+
+  # Split: func_80045144 is a real alternate entry point (called via
+  # function pointer); discovery had it inside func_80045004.
+  [[section.functions]]
+  name = "func_80045144"
+  vram = 0x80045144
+  size = 0x1D0
 
   [[section.functions]]
   name = "func_80045314"

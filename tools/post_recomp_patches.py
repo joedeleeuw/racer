@@ -27,6 +27,23 @@ MARKER = "@post-recomp-redirect"
 # func name -> ultramodern reimplementation to call instead
 REDIRECTS = {
     "func_80087D70": "osPiStartDma_recomp",   # game osPiStartDma -> bypass dead PI manager
+    # func_8008C930_exception is the game's real osSendMesg (blocking, wakes
+    # receivers via osStartThread); the scheduler's frame-done send goes through
+    # it. Left stubbed, every send through it vanishes and the OSSched client
+    # protocol deadlocks. Route it to ultramodern's osSendMesg.
+    "func_8008C930_exception": "osSendMesg_recomp",
+    # "dma_read_rom" is a misidentification: VA 0x8008A6B4 is the game's
+    # sprintf (stores register args to caller-frame homes, calls vformatter
+    # func_80093180 with emit cb 0x8008A690, NUL-terminates). The vformatter's
+    # conversion dispatcher is an indirect ROM jump table that static
+    # recompilation can't resolve, so the cluster is stubbed and every sprintf
+    # call crashed the menu text path in bcopy. Route to the native
+    # guest-ABI sprintf in main.cpp.
+    "dma_read_rom": "swe1r_sprintf",
+    # func_8008A710 is the game's osPiReadIo (a0=cart addr, a1=u32* out). Its
+    # get-access/raw-read/rel-access leaves are stubbed, so the word-at-a-time
+    # ROM reader fed the asset loader garbage and every asset lookup failed.
+    "func_8008A710": "swe1r_pi_read_io",
 }
 
 def main():

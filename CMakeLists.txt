@@ -4,6 +4,7 @@ project(SWE1Racer VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
+set(CMAKE_C_STANDARD 17)
 
 # =============================================================================
 # Options
@@ -12,21 +13,33 @@ set(N64_MODERN_RUNTIME_DIR "${CMAKE_SOURCE_DIR}/../N64ModernRuntime" CACHE PATH
     "Path to N64ModernRuntime")
 set(RT64_DIR "${CMAKE_SOURCE_DIR}/../rt64" CACHE PATH
     "Path to RT64 renderer")
-set(CMAKE_TOOLCHAIN_FILE "C:/vcpkg/scripts/buildsystems/vcpkg.cmake" CACHE PATH
-    "vcpkg toolchain file")
 
 # =============================================================================
-# SDL2 (via vcpkg)
+# SDL2
+#   Windows: vcpkg toolchain (unchanged).
+#   Linux:   system SDL2 (RT64 is built to take the SDL window directly).
 # =============================================================================
-find_package(SDL2 CONFIG REQUIRED)
+if (WIN32)
+    set(CMAKE_TOOLCHAIN_FILE "C:/vcpkg/scripts/buildsystems/vcpkg.cmake" CACHE PATH
+        "vcpkg toolchain file")
+    find_package(SDL2 CONFIG REQUIRED)
+    link_directories("C:/vcpkg/installed/x64-windows/lib")
+    link_directories("C:/vcpkg/installed/x64-windows/lib/manual-link")
+else()
+    set(CMAKE_THREAD_PREFER_PTHREAD TRUE)
+    set(THREADS_PREFER_PTHREAD_FLAG TRUE)
+    find_package(Threads REQUIRED)
+    find_package(SDL2 REQUIRED)
+endif()
 
 # =============================================================================
 # RT64 Renderer
 # =============================================================================
-# RT64 links SDL2 by bare name; ensure vcpkg's lib dir is on the search path
-link_directories("C:/vcpkg/installed/x64-windows/lib")
-link_directories("C:/vcpkg/installed/x64-windows/lib/manual-link")
 set(RT64_STATIC ON CACHE BOOL "Build RT64 as static library" FORCE)
+if (CMAKE_SYSTEM_NAME MATCHES "Linux")
+    # RT64 takes the SDL_Window* handle directly and renders through Vulkan.
+    set(RT64_SDL_WINDOW_VULKAN ON CACHE BOOL "Build RT64 to expect an SDL Window" FORCE)
+endif()
 add_subdirectory(${RT64_DIR} ${CMAKE_BINARY_DIR}/rt64)
 
 # =============================================================================
@@ -42,15 +55,15 @@ file(GLOB RECOMP_SOURCES "RecompiledFuncs/*.c")
 add_library(RecompiledFuncs STATIC ${RECOMP_SOURCES})
 
 target_include_directories(RecompiledFuncs PRIVATE
-    ${N64_MODERN_RUNTIME_DIR}/N64Recomp/include  # recomp.h
-    ${CMAKE_SOURCE_DIR}/RecompiledFuncs           # funcs.h
+    ${N64_MODERN_RUNTIME_DIR}/N64Recomp/include
+    ${CMAKE_SOURCE_DIR}/RecompiledFuncs
 )
 
-# Disable strict aliasing for recompiled code (MIPS memory access patterns)
 if(MSVC)
-    # MSVC doesn't have strict aliasing by default
+    # MSVC doesn't enforce strict aliasing.
 else()
-    target_compile_options(RecompiledFuncs PRIVATE -fno-strict-aliasing)
+    target_compile_options(RecompiledFuncs PRIVATE -fno-strict-aliasing
+        -Wno-unused-variable -Wno-implicit-function-declaration)
 endif()
 
 # =============================================================================
@@ -64,29 +77,38 @@ add_executable(SWE1Racer
 )
 
 target_include_directories(SWE1Racer PRIVATE
-    ${N64_MODERN_RUNTIME_DIR}/N64Recomp/include     # recomp.h
-    ${N64_MODERN_RUNTIME_DIR}/librecomp/include      # librecomp headers
-    ${N64_MODERN_RUNTIME_DIR}/ultramodern/include    # ultramodern headers
-    ${RT64_DIR}/src                                   # RT64 headers
-    ${RT64_DIR}/src/contrib                           # RT64 contrib (json, im3d, etc.)
-    ${RT64_DIR}/src/contrib/hlslpp/include            # hlsl++
-    ${RT64_DIR}/src/contrib/plume                     # plume render interface
-    ${RT64_DIR}/src/contrib/imgui                     # imgui
-    ${RT64_DIR}/src/contrib/mupen64plus-core/src/api  # mupen64plus API types
-    ${CMAKE_SOURCE_DIR}/RecompiledFuncs              # funcs.h
+    ${N64_MODERN_RUNTIME_DIR}/N64Recomp/include
+    ${N64_MODERN_RUNTIME_DIR}/librecomp/include
+    ${N64_MODERN_RUNTIME_DIR}/ultramodern/include
+    ${RT64_DIR}/src
+    ${RT64_DIR}/src/contrib
+    ${RT64_DIR}/src/contrib/hlslpp/include
+    ${RT64_DIR}/src/contrib/plume
+    ${RT64_DIR}/src/contrib/imgui
+    ${RT64_DIR}/src/contrib/mupen64plus-core/src/api
+    ${RT64_DIR}/src/contrib/stb
+    ${CMAKE_SOURCE_DIR}/RecompiledFuncs
     ${CMAKE_SOURCE_DIR}/include
 )
 
-# RT64 requires these defines for its headers (normally set at directory scope)
 target_compile_definitions(SWE1Racer PRIVATE NOMINMAX HLSL_CPU FFX_GCC)
+
+if (CMAKE_SYSTEM_NAME MATCHES "Linux")
+    target_compile_definitions(SWE1Racer PRIVATE RT64_SDL_WINDOW_VULKAN)
+    target_include_directories(SWE1Racer PRIVATE ${SDL2_INCLUDE_DIRS})
+    # -g + -rdynamic keep the recompiled func_XXXX names resolvable in the
+    # backtrace that the POSIX crash handler prints.
+    target_compile_options(SWE1Racer PRIVATE -g)
+    target_link_options(SWE1Racer PRIVATE -rdynamic)
+    target_link_libraries(SWE1Racer PRIVATE rt64 SDL2::SDL2 ${CMAKE_DL_LIBS} Threads::Threads -latomic)
+else()
+    target_link_libraries(SWE1Racer PRIVATE rt64 SDL2::SDL2 SDL2::SDL2main)
+endif()
 
 target_link_libraries(SWE1Racer PRIVATE
     RecompiledFuncs
     librecomp
     ultramodern
-    rt64
-    SDL2::SDL2
-    SDL2::SDL2main
 )
 
 if(WIN32)
