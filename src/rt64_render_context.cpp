@@ -160,6 +160,7 @@ public:
         // Create the RT64 Application
         printf("[SWE1R] Creating RT64 application...\n");
         app_ = std::make_unique<RT64::Application>(core, app_config);
+        app_->enhancementConfig.presentation.removeBlackBorders = false;
 
         // Run setup (creates graphics device, swap chain, shader caches, etc.)
 #if defined(_WIN32)
