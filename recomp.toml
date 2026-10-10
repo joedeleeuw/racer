@@ -39,8 +39,6 @@ stubs = [
     "func_8008C560",
     "func_8008C190",
     "func_8008C280",
-    # func_8008C390 split: tail portion still stubbed
-    "func_8008C390_tail",
     # osRecvMesg, osSendMesg, osGetCount: handled by N64Recomp reimplemented_funcs
     "func_8008C770",
     "func_8008C7B0",

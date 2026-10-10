@@ -13,6 +13,8 @@
 #include <algorithm>
 #include <fstream>
 #include <sstream>
+#include <atomic>
+#include <utility>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -91,84 +93,88 @@ extern void swe1r_set_frequency(uint32_t freq);
 // native fault addresses back into N64 virtual addresses.
 static uint8_t* g_rdram_base = nullptr;
 
-// SI DMA: the game's __osSiRawStartDma is COP0/MMIO based and can't be
-// recompiled. It moves a 64-byte block between DRAM and PIF RAM and raises an
-// SI interrupt on completion.
-//
-//   a0 = direction (1 = DRAM->PIF write, 0 = PIF->DRAM read)
-//   a1 = DRAM buffer address
-//
-// There is no PIF hardware here. On a write we save the command block; on a
-// read we answer per command: status (boot probe, func_800899E8) or button
-// data from the host input callback. Controller 0 is reported present
-// (standard pad, no pak); channels 1-3 report "no controller" via the error
-// bits in byte 2.
-//   byte0 pad | byte1 txsize | byte2 rxsize/error | byte3 cmd
-//   byte4..7: type_lo/hi + status (status cmd) or buttons/stick (read cmd)
-// The parser checks (byte2 & 0xC0) for an error, reads type from byte4/5 and
-// the pak/status flag from byte6.
-bool get_input(int controller_num, uint16_t* buttons, float* x, float* y); // defined with the input callbacks below
+// The game's __osSiRawStartDma moves the 64-byte PIF RAM block over COP0/MMIO,
+// so the adapter owns the PIF: a write latches the guest's joybus command
+// block, a read executes it against the host pad on channel 0 and returns the
+// block with responses filled in. Other channels report no device.
+struct HostPad {
+    uint16_t buttons;
+    int8_t stick_x;
+    int8_t stick_y;
+};
+
+static std::atomic<uint32_t> g_host_pad{ 0 };
+
+static HostPad read_host_pad() {
+    const uint32_t packed = g_host_pad.load(std::memory_order_relaxed);
+    return { (uint16_t)packed, (int8_t)(packed >> 16), (int8_t)(packed >> 24) };
+}
+
+static uint32_t pack_host_pad(const HostPad& pad) {
+    return pad.buttons | ((uint32_t)(uint8_t)pad.stick_x << 16) | ((uint32_t)(uint8_t)pad.stick_y << 24);
+}
+
+constexpr uint32_t pif_ram_size = 64;
+constexpr uint8_t joybus_no_response = 0x80;
+
+static uint8_t g_pif_ram[pif_ram_size];
+
+static bool joybus_controller(const uint8_t* send, uint8_t* recv, uint32_t rx) {
+    switch (send[0]) {
+    case 0x00:
+    case 0xFF: {
+        const uint8_t status[] = { 0x05, 0x00, 0x00 };
+        memcpy(recv, status, std::min<uint32_t>(rx, sizeof(status)));
+        return true;
+    }
+    case 0x01: {
+        const HostPad pad = read_host_pad();
+        const uint8_t state[] = { (uint8_t)(pad.buttons >> 8), (uint8_t)pad.buttons, (uint8_t)pad.stick_x, (uint8_t)pad.stick_y };
+        memcpy(recv, state, std::min<uint32_t>(rx, sizeof(state)));
+        static uint32_t last_reported = 0xFFFFFFFFu;
+        if (pack_host_pad(pad) != last_reported) {
+            last_reported = pack_host_pad(pad);
+            printf("[si] guest read pad buttons=0x%04X stick=%d,%d\n", pad.buttons, pad.stick_x, pad.stick_y);
+        }
+        return true;
+    }
+    default:
+        printf("[si] controller command 0x%02X unsupported\n", send[0]);
+        return false;
+    }
+}
+
+static void execute_pif_ram(uint8_t* rdram, gpr dram) {
+    uint32_t channel = 0;
+    uint32_t i = 0;
+    while (i < pif_ram_size - 1) {
+        const uint8_t tx_byte = g_pif_ram[i];
+        if (tx_byte == 0xFE) break;
+        if (tx_byte == 0xFF) { i++; continue; }
+        if (tx_byte == 0x00 || tx_byte == 0xFD) { channel++; i++; continue; }
+        const uint32_t tx = tx_byte & 0x3F;
+        const uint32_t rx = g_pif_ram[i + 1] & 0x3F;
+        const uint32_t send = i + 2;
+        const uint32_t recv = send + tx;
+        if (tx == 0 || recv + rx > pif_ram_size - 1) break;
+        const bool answered = channel == 0 && joybus_controller(&g_pif_ram[send], &g_pif_ram[recv], rx);
+        if (!answered) g_pif_ram[i + 1] |= joybus_no_response;
+        i = recv + rx;
+        channel++;
+    }
+    g_pif_ram[pif_ram_size - 1] = 0;
+    for (uint32_t b = 0; b < pif_ram_size; b++) MEM_B(b, dram) = (int8_t)g_pif_ram[b];
+}
 
 extern "C" void __osSiRawStartDma_recomp(uint8_t* rdram, recomp_context* ctx) {
-    int32_t  dir = (int32_t)ctx->r4;
-    uint32_t buf = (uint32_t)ctx->r5;
-
-    // The game writes the PIF command block (dir=1) then reads the response
-    // (dir=0) through the same 8-bytes-per-channel layout:
-    //   byte0 pad | byte1 txsize | byte2 rxsize/error | byte3 cmd | byte4..7 data
-    // Keep the last command block so reads answer per command:
-    // cmd 0x00/0xFF = controller status (boot probe), cmd 0x01 = read buttons.
-    static uint8_t pif_cmd[32]; // 4 channels x 8 bytes, guest byte order
-    static bool pif_cmd_valid = false;
-    auto w32 = [&](uint32_t addr, uint32_t value) {
-        // Big-endian-packed word writes land the bytes correctly for the
-        // recompiled MEM_B (XOR 3) accessors.
-        *(uint32_t*)(rdram + (addr - 0x80000000u)) = value;
-    };
-    if (dir == 1 && buf != 0) {
-        for (int i = 0; i < 32; i++) pif_cmd[i] = (uint8_t)MEM_B(i, buf);
-        pif_cmd_valid = true;
-        static int si_wr_log = 0;
-        if ((si_wr_log++ % 300) == 0) {
-            printf("[si] write @0x%08X:", buf);
-            for (int i = 0; i < 32; i++) printf(" %02X", pif_cmd[i]);
-            printf("\n");
-        }
-    } else if (dir == 0 && buf != 0) {
-        uint16_t buttons = 0;
-        float sx = 0.0f, sy = 0.0f;
-        get_input(0, &buttons, &sx, &sy);
-        const int8_t stick_x = (int8_t)(sx * 84.0f);
-        const int8_t stick_y = (int8_t)(sy * 84.0f);
-        for (int ch = 0; ch < 4; ch++) {
-            const uint8_t cmd = pif_cmd_valid ? pif_cmd[ch * 8 + 3] : 0xFF;
-            uint32_t c = buf + ch * 8;
-            if (ch == 0) {
-                if (cmd == 0x01) {
-                    // Read: rx=4 data bytes (buttons BE, stick x, stick y).
-                    w32(c + 0, 0xFF010401u);
-                    w32(c + 4, (uint32_t)buttons | ((uint32_t)(uint8_t)stick_x << 16)
-                              | ((uint32_t)(uint8_t)stick_y << 24));
-                } else {
-                    // Status: standard pad present, no pak.
-                    w32(c + 0, 0xFF010300u);
-                    w32(c + 4, 0x050000FFu);
-                }
-            } else {
-                w32(c + 0, 0xFF018300u); // byte2=0x83 -> error bit set
-                w32(c + 4, 0xFFFFFFFFu); // no controller on this channel
-            }
-        }
-        static int si_log = 0;
-        if ((si_log++ % 300) == 0) {
-            printf("[si] read: cmd=0x%02X buttons=0x%04X stick=%d,%d\n",
-                   pif_cmd_valid ? pif_cmd[3] : 0xFF, buttons, stick_x, stick_y);
-        }
+    const gpr dram = ctx->r5;
+    if ((int32_t)ctx->r4 == 1) {
+        for (uint32_t b = 0; b < pif_ram_size; b++) g_pif_ram[b] = MEM_BU(b, dram);
+    } else {
+        execute_pif_ram(rdram, dram);
     }
-
-    // No real hardware to wait on — signal SI completion immediately.
     ultramodern::send_si_message();
-    ctx->r2 = 0; // success
+    ctx->r2 = 0;
 }
 
 // =============================================================================
@@ -354,20 +360,6 @@ extern "C" void swe1r_pi_read_io(uint8_t* rdram, recomp_context* ctx) {
 }
 
 // =============================================================================
-// Hand-written entry points for late-discovered function starts
-// =============================================================================
-// Function discovery placed func_8004441C eight bytes late; the true entry at
-// 0x80044414 first loads the flag global at 0x800D7700 into v0, and callers
-// jal there directly. Mirrors the two instructions, then chains into the
-// discovered body. Registered via HAND_ENTRIES in tools/gen_lookup_table.py.
-extern "C" void func_8004441C(uint8_t* rdram, recomp_context* ctx);
-extern "C" void func_80044414(uint8_t* rdram, recomp_context* ctx) {
-    // 0x80044414: lui v0, 0x800d / 0x80044418: lw v0, 0x7700(v0)
-    ctx->r2 = MEM_W(0x7700, 0xFFFFFFFF800D0000ull);
-    func_8004441C(rdram, ctx);
-}
-
-// =============================================================================
 // ROM Hash: Star Wars Episode I: Racer (US)
 // CRC1: 0x72F70398  CRC2: 0x6556A98B
 // =============================================================================
@@ -468,8 +460,61 @@ ultramodern::renderer::WindowHandle create_window(ultramodern::gfx_callbacks_t::
 #endif
 }
 
+static std::vector<SDL_GameController*> g_controllers;
+
+static int8_t n64_axis(int16_t value) {
+    constexpr int deadzone = 2600;
+    if (value > -deadzone && value < deadzone) return 0;
+    return (int8_t)std::clamp(value * 85 / 32767, -85, 85);
+}
+
+static HostPad sample_host_pad() {
+    HostPad pad{};
+    const uint8_t* keys = SDL_GetKeyboardState(nullptr);
+    if (keys[SDL_SCANCODE_RETURN]) pad.buttons |= 0x8000;
+    if (keys[SDL_SCANCODE_LSHIFT]) pad.buttons |= 0x4000;
+    if (keys[SDL_SCANCODE_Z])      pad.buttons |= 0x2000;
+    if (keys[SDL_SCANCODE_SPACE])  pad.buttons |= 0x1000;
+    if (keys[SDL_SCANCODE_UP])     pad.buttons |= 0x0800;
+    if (keys[SDL_SCANCODE_DOWN])   pad.buttons |= 0x0400;
+    if (keys[SDL_SCANCODE_LEFT])   pad.buttons |= 0x0200;
+    if (keys[SDL_SCANCODE_RIGHT])  pad.buttons |= 0x0100;
+    int stick_x = (keys[SDL_SCANCODE_D] ? 85 : 0) - (keys[SDL_SCANCODE_A] ? 85 : 0);
+    int stick_y = (keys[SDL_SCANCODE_W] ? 85 : 0) - (keys[SDL_SCANCODE_S] ? 85 : 0);
+
+    constexpr std::pair<SDL_GameControllerButton, uint16_t> button_map[] = {
+        { SDL_CONTROLLER_BUTTON_A, 0x8000 },
+        { SDL_CONTROLLER_BUTTON_X, 0x4000 },
+        { SDL_CONTROLLER_BUTTON_START, 0x1000 },
+        { SDL_CONTROLLER_BUTTON_DPAD_UP, 0x0800 },
+        { SDL_CONTROLLER_BUTTON_DPAD_DOWN, 0x0400 },
+        { SDL_CONTROLLER_BUTTON_DPAD_LEFT, 0x0200 },
+        { SDL_CONTROLLER_BUTTON_DPAD_RIGHT, 0x0100 },
+        { SDL_CONTROLLER_BUTTON_LEFTSHOULDER, 0x0020 },
+        { SDL_CONTROLLER_BUTTON_RIGHTSHOULDER, 0x0010 },
+    };
+    constexpr int16_t trigger_threshold = 16384;
+    for (SDL_GameController* controller : g_controllers) {
+        for (const auto& [button, mask] : button_map) {
+            if (SDL_GameControllerGetButton(controller, button)) pad.buttons |= mask;
+        }
+        if (SDL_GameControllerGetAxis(controller, SDL_CONTROLLER_AXIS_TRIGGERLEFT) > trigger_threshold) pad.buttons |= 0x2000;
+        if (SDL_GameControllerGetAxis(controller, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > trigger_threshold) pad.buttons |= 0x0010;
+        const int16_t right_x = SDL_GameControllerGetAxis(controller, SDL_CONTROLLER_AXIS_RIGHTX);
+        const int16_t right_y = SDL_GameControllerGetAxis(controller, SDL_CONTROLLER_AXIS_RIGHTY);
+        if (right_y < -trigger_threshold) pad.buttons |= 0x0008;
+        if (right_y > trigger_threshold) pad.buttons |= 0x0004;
+        if (right_x < -trigger_threshold) pad.buttons |= 0x0002;
+        if (right_x > trigger_threshold) pad.buttons |= 0x0001;
+        stick_x += n64_axis(SDL_GameControllerGetAxis(controller, SDL_CONTROLLER_AXIS_LEFTX));
+        stick_y -= n64_axis(SDL_GameControllerGetAxis(controller, SDL_CONTROLLER_AXIS_LEFTY));
+    }
+    pad.stick_x = (int8_t)std::clamp(stick_x, -85, 85);
+    pad.stick_y = (int8_t)std::clamp(stick_y, -85, 85);
+    return pad;
+}
+
 void update_gfx(ultramodern::gfx_callbacks_t::gfx_data_t) {
-    // Process SDL events
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
         switch (event.type) {
@@ -481,61 +526,38 @@ void update_gfx(ultramodern::gfx_callbacks_t::gfx_data_t) {
                     ultramodern::quit();
                 }
                 break;
+            case SDL_CONTROLLERDEVICEADDED:
+                if (SDL_GameController* controller = SDL_GameControllerOpen(event.cdevice.which)) {
+                    g_controllers.push_back(controller);
+                    printf("[input] controller opened: %s\n", SDL_GameControllerName(controller));
+                }
+                break;
+            case SDL_CONTROLLERDEVICEREMOVED:
+                std::erase_if(g_controllers, [&](SDL_GameController* controller) {
+                    if (SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(controller)) != event.cdevice.which) return false;
+                    printf("[input] controller closed: %s\n", SDL_GameControllerName(controller));
+                    SDL_GameControllerClose(controller);
+                    return true;
+                });
+                break;
         }
+    }
+    const uint32_t packed = pack_host_pad(sample_host_pad());
+    if (g_host_pad.exchange(packed, std::memory_order_relaxed) != packed) {
+        const HostPad pad = read_host_pad();
+        printf("[input] host pad buttons=0x%04X stick=%d,%d\n", pad.buttons, pad.stick_x, pad.stick_y);
     }
 }
 
-// =============================================================================
-// Input Callbacks (stub)
-// =============================================================================
-
 void poll_input() {
-    // SDL event polling is done in update_gfx
 }
 
 bool get_input(int controller_num, uint16_t* buttons, float* x, float* y) {
     if (controller_num != 0) return false;
-
-    *buttons = 0;
-    *x = 0.0f;
-    *y = 0.0f;
-
-    // Debug harness: SWE1R_SCRIPT_INPUT="frame:mask,frame:mask,..." presses the
-    // given N64 button mask for exactly one call once the call counter passes
-    // the frame. Proves the guest consumes the SI input path end-to-end without
-    // needing a focused keyboard in a headless session.
-    static const char* script = getenv("SWE1R_SCRIPT_INPUT");
-    static unsigned long call_count = 0;
-    call_count++;
-    if (script && *script) {
-        unsigned long frame = 0; unsigned int mask = 0; int used = 0;
-        if (sscanf(script, "%lu:%x%n", &frame, &mask, &used) == 2 && call_count >= frame) {
-            *buttons |= (uint16_t)mask;
-            script += used;
-            if (*script == ',') script++; else { script = ""; }
-        }
-        return true;
-    }
-
-    // Basic keyboard input
-    const uint8_t* keys = SDL_GetKeyboardState(nullptr);
-
-    // N64 button mappings
-    if (keys[SDL_SCANCODE_RETURN]) *buttons |= 0x8000; // A
-    if (keys[SDL_SCANCODE_LSHIFT]) *buttons |= 0x4000; // B
-    if (keys[SDL_SCANCODE_Z])      *buttons |= 0x2000; // Z
-    if (keys[SDL_SCANCODE_SPACE])  *buttons |= 0x1000; // Start
-    if (keys[SDL_SCANCODE_UP])     *buttons |= 0x0800; // D-Up
-    if (keys[SDL_SCANCODE_DOWN])   *buttons |= 0x0400; // D-Down
-    if (keys[SDL_SCANCODE_LEFT])   *buttons |= 0x0200; // D-Left
-    if (keys[SDL_SCANCODE_RIGHT])  *buttons |= 0x0100; // D-Right
-
-    // Analog stick via WASD
-    if (keys[SDL_SCANCODE_W]) *y += 1.0f;
-    if (keys[SDL_SCANCODE_S]) *y -= 1.0f;
-    if (keys[SDL_SCANCODE_A]) *x -= 1.0f;
-    if (keys[SDL_SCANCODE_D]) *x += 1.0f;
-
+    const HostPad pad = read_host_pad();
+    *buttons = pad.buttons;
+    *x = pad.stick_x / 85.0f;
+    *y = pad.stick_y / 85.0f;
     return true;
 }
 
@@ -874,7 +896,7 @@ int main(int argc, char* argv[]) {
     game_entry.display_name = "Star Wars Episode I: Racer";
     game_entry.game_id = u8"swe1racer";
     game_entry.mod_game_id = "swe1racer";
-    game_entry.save_type = recomp::SaveType::Eep4k;
+    game_entry.save_type = recomp::SaveType::Eep16k;
     game_entry.is_enabled = true;
     game_entry.entrypoint_address = (gpr)(int32_t)0x80000400; // Sign-extend for MEM macros
     game_entry.entrypoint = recomp_entrypoint;

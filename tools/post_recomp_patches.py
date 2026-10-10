@@ -44,6 +44,13 @@ REDIRECTS = {
     # get-access/raw-read/rel-access leaves are stubbed, so the word-at-a-time
     # ROM reader fed the asset loader garbage and every asset lookup failed.
     "func_8008A710": "swe1r_pi_read_io",
+    # 0x8008C100/0x8008C190/0x8008C280 are the game's osEepromLongRead,
+    # osEepromLongWrite and osEepromProbe, not COP0 helpers. Stubbed, the save
+    # loader never initialised the profile at 0x80113680, and attract mode spun
+    # forever picking a random racer from its empty unlock mask.
+    "func_8008C100_dispatch": "osEepromLongRead_recomp",
+    "func_8008C190": "osEepromLongWrite_recomp",
+    "func_8008C280": "osEepromProbe_recomp",
 }
 
 def main():
