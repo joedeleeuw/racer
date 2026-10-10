@@ -74,6 +74,7 @@ add_executable(SWE1Racer
     src/section_table.cpp
     src/rt64_render_context.cpp
     src/audio.cpp
+    rsp/aspMain.cpp
 )
 
 target_include_directories(SWE1Racer PRIVATE
@@ -99,6 +100,7 @@ if (CMAKE_SYSTEM_NAME MATCHES "Linux")
     # -g + -rdynamic keep the recompiled func_XXXX names resolvable in the
     # backtrace that the POSIX crash handler prints.
     target_compile_options(SWE1Racer PRIVATE -g)
+    set_source_files_properties(rsp/aspMain.cpp PROPERTIES COMPILE_OPTIONS -msse4.1)
     target_link_options(SWE1Racer PRIVATE -rdynamic)
     target_link_libraries(SWE1Racer PRIVATE rt64 SDL2::SDL2 ${CMAKE_DL_LIBS} Threads::Threads -latomic)
 else()

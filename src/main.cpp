@@ -374,26 +374,13 @@ static SDL_Window* g_window = nullptr;
 // RSP Callbacks
 // =============================================================================
 
-// No-op RSP microcode. We don't yet have SWE1R's recompiled audio microcode
-// (that would come from N64Recomp's RSPRecomp, like pokemonsnap's aspMain).
-// Returning nullptr makes ultramodern's run_task abort the whole process, so
-// instead we pretend audio tasks completed (RspExitReason::Broke). Result: no
-// sound yet, but the game proceeds — and graphics tasks (M_GFXTASK) never reach
-// here anyway; submit_rsp_task routes those straight to the RT64 renderer.
-static RspExitReason swe1r_noop_ucode(uint8_t* /*rdram*/, uint32_t /*ucode_addr*/) {
-    return RspExitReason::Broke;
-}
+RspUcodeFunc aspMain;
 
 RspUcodeFunc* get_rsp_microcode(const OSTask* task) {
-    static uint32_t rsp_call_count = 0;
-    rsp_call_count++;
-    if (rsp_call_count <= 5 || (rsp_call_count % 120 == 0)) {
-        fprintf(stderr, "[SWE1R] get_rsp_microcode #%u: type=%u ucode=0x%08X data=0x%08X\n",
-                rsp_call_count, task->t.type,
-                (uint32_t)task->t.ucode, (uint32_t)task->t.ucode_data);
+    if (task->t.type == M_AUDTASK) {
+        return aspMain;
     }
-    // Only non-graphics (audio) tasks reach here; no-op them for now.
-    return swe1r_noop_ucode;
+    return nullptr;
 }
 
 // =============================================================================

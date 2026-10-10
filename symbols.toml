@@ -292,7 +292,12 @@ size = 0x98000
   [[section.functions]]
   name = "func_80007594"
   vram = 0x80007594
-  size = 0x194
+  size = 0x17C
+
+  [[section.functions]]
+  name = "func_80007710"
+  vram = 0x80007710
+  size = 0x18
 
   [[section.functions]]
   name = "func_80007728"
@@ -3586,24 +3591,34 @@ size = 0x98000
   size = 0x40
 
   [[section.functions]]
-  name = "func_80088150"
+  name = "osAiSetFrequency"
   vram = 0x80088150
-  size = 0x0C
+  size = 0x160
 
   [[section.functions]]
-  name = "func_8008815C"
-  vram = 0x8008815C
-  size = 0x154
-
-  [[section.functions]]
-  name = "func_800882B0"
+  name = "osAiSetNextBuffer"
   vram = 0x800882B0
   size = 0xB0
 
   [[section.functions]]
   name = "func_80088360"
   vram = 0x80088360
-  size = 0xF0
+  size = 0x80
+
+  [[section.functions]]
+  name = "osAiGetLength"
+  vram = 0x800883E0
+  size = 0x10
+
+  [[section.functions]]
+  name = "func_800883F0"
+  vram = 0x800883F0
+  size = 0x8
+
+  [[section.functions]]
+  name = "func_800883F8"
+  vram = 0x800883F8
+  size = 0x58
 
   [[section.functions]]
   name = "func_80088450"
@@ -3621,7 +3636,7 @@ size = 0x98000
   size = 0x298
 
   [[section.functions]]
-  name = "cache_writeback_800887D0"
+  name = "alSynNew"
   vram = 0x800887D0
   size = 0x300
 
@@ -3638,7 +3653,12 @@ size = 0x98000
   [[section.functions]]
   name = "func_80088B70"
   vram = 0x80088B70
-  size = 0x5D4
+  size = 0x8C
+
+  [[section.functions]]
+  name = "func_80088BFC"
+  vram = 0x80088BFC
+  size = 0x548
 
   [[section.functions]]
   name = "func_80089144"
@@ -3761,7 +3781,12 @@ size = 0x98000
   [[section.functions]]
   name = "func_8008ACD8"
   vram = 0x8008ACD8
-  size = 0xD8
+  size = 0xC8
+
+  [[section.functions]]
+  name = "osAiGetStatus"
+  vram = 0x8008ADA0
+  size = 0x10
 
   [[section.functions]]
   name = "func_8008ADB0"
@@ -3898,14 +3923,19 @@ size = 0x98000
   size = 0x210
 
   [[section.functions]]
-  name = "func_8008C770"
+  name = "osViGetCurrentFramebuffer"
   vram = 0x8008C770
   size = 0x40
 
   [[section.functions]]
-  name = "func_8008C7B0"
+  name = "osJamMesg"
   vram = 0x8008C7B0
-  size = 0x180
+  size = 0x150
+
+  [[section.functions]]
+  name = "func_8008C900"
+  vram = 0x8008C900
+  size = 0x28
 
   [[section.functions]]
   # Split: exception handler (0x150) + __osDisableInt (0x20) + __osRestoreInt (0x28)
@@ -3989,7 +4019,12 @@ size = 0x98000
   [[section.functions]]
   name = "func_8008DCB0"
   vram = 0x8008DCB0
-  size = 0xD0
+  size = 0xA0
+
+  [[section.functions]]
+  name = "func_8008DD50"
+  vram = 0x8008DD50
+  size = 0x30
 
   [[section.functions]]
   name = "func_8008DD80"
@@ -4014,19 +4049,12 @@ size = 0x98000
   [[section.functions]]
   name = "func_8008E54C"
   vram = 0x8008E54C
-  size = 0x4A8
+  size = 0x4A4
 
   [[section.functions]]
-  # Split: jr ra stub (0x10) + osSetEventMesg (0xD8)
-  name = "func_8008E9F4_stub"
-  vram = 0x8008E9F4
-  size = 0x10
-
-  [[section.functions]]
-  # Standard libultra copy - dead code (zero call sites), game uses custom version at 0x8008AE30
-  name = "osSetEventMesg_unused_8008EA04"
-  vram = 0x8008EA04
-  size = 0xD8
+  name = "func_8008E9F0"
+  vram = 0x8008E9F0
+  size = 0xEC
 
   [[section.functions]]
   name = "func_8008EADC"
@@ -4051,12 +4079,22 @@ size = 0x98000
   [[section.functions]]
   name = "func_8008F3FC"
   vram = 0x8008F3FC
-  size = 0x584
+  size = 0x554
+
+  [[section.functions]]
+  name = "func_8008F950"
+  vram = 0x8008F950
+  size = 0x30
 
   [[section.functions]]
   name = "func_8008F980"
   vram = 0x8008F980
-  size = 0x114
+  size = 0xE0
+
+  [[section.functions]]
+  name = "func_8008FA60"
+  vram = 0x8008FA60
+  size = 0x34
 
   [[section.functions]]
   name = "func_8008FA94"
@@ -4109,7 +4147,7 @@ size = 0x98000
   size = 0x90
 
   [[section.functions]]
-  name = "osSetIntMask"
+  name = "func_80090170"
   vram = 0x80090170
   size = 0x90
 
@@ -4129,14 +4167,19 @@ size = 0x98000
   size = 0xA0
 
   [[section.functions]]
-  name = "osAiSetFrequency"
+  name = "func_800903D0"
   vram = 0x800903D0
   size = 0x80
 
   [[section.functions]]
-  name = "osAiSetNextBuffer"
+  name = "func_80090450"
   vram = 0x80090450
-  size = 0x150
+  size = 0xB0
+
+  [[section.functions]]
+  name = "osSetIntMask"
+  vram = 0x80090500
+  size = 0xA0
 
   [[section.functions]]
   name = "func_800905A0"
@@ -4411,12 +4454,12 @@ size = 0x98000
   [[section.functions]]
   name = "func_80095F34"
   vram = 0x80095F34
-  size = 0x228
+  size = 0x224
 
   [[section.functions]]
-  name = "func_8009615C"
-  vram = 0x8009615C
-  size = 0x270
+  name = "func_80096158"
+  vram = 0x80096158
+  size = 0x274
 
   [[section.functions]]
   name = "func_800963CC"

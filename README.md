@@ -169,11 +169,14 @@ make recomp N64RECOMP=/path/to/N64Recomp/build/Release/N64Recomp.exe
 # 3. Generate the function lookup table
 python tools/gen_lookup_table.py
 
-# 4. Build the native executable
+# 4. Recompile the aspMain audio microcode (RSP -> C++, writes rsp/aspMain.cpp)
+/path/to/N64Recomp/build/RSPRecomp aspMain.toml
+
+# 5. Build the native executable
 cmake -B build -G "Visual Studio 17 2022"
 cmake --build build --config Release
 
-# 5. Run it!
+# 6. Run it!
 build/Release/SWE1Racer.exe
 ```
 
